@@ -75,7 +75,7 @@ Model names change over time and differ per account. To list the models your key
 (Invoke-RestMethod -Uri "$env:BASE_URL/models" -Headers @{Authorization="Bearer $env:API_KEY"}).data.id
 ```
 
-Pick one that supports image input. The page may say "configured model was not listed" for some providers (for example Gemini prefixes names with `models/`); this is harmless if rows fill in correctly.
+Pick one that supports image input, and confirm the exact ID in your provider's model documentation. `/health` ignores a leading `models/` prefix; add `?probe=true` (e.g. `http://127.0.0.1:8000/health?probe=true`) to send a 1-token test request. This uses a little quota.
 
 Do not commit API keys or real invoices to Git.
 
@@ -103,7 +103,7 @@ All settings are environment variables.
 2. Sends all pages of each PDF (up to `MAX_PDF_PAGES`) or a supported image to the vision model.
 3. Extracts vendor, invoice number, date, GSTIN, subtotal, tax, total, and a category.
 4. Normalizes common date and currency formats.
-5. Flags missing or unreadable key fields, invalid GSTIN **format**, unrecognized categories, and cases where subtotal + tax differs from total by more than ₹1.
+5. Flags missing or unreadable key fields, invalid GSTIN **format**, unrecognized categories, and cases where subtotal + tax differs from total by more than `AMOUNT_TOLERANCE` (default ₹1).
 6. Shows a review table and totals by category, with a CSV download.
 
 Supported uploads: PDF, JPG/JPEG, PNG, WEBP, BMP, TIF/TIFF. Up to 30 files per batch.
@@ -113,7 +113,8 @@ Supported uploads: PDF, JPG/JPEG, PNG, WEBP, BMP, TIF/TIFF. Up to 30 files per b
 Hosted free tiers limit requests and tokens, so the app is built to handle that:
 
 - **HTTP 429 / 5xx:** retried automatically with backoff, honoring the provider's `Retry-After` time.
-- **Daily quota reached:** the app stops retrying (waiting would not help) and switches to the next model in `FALLBACK_MODELS` if one is set. Otherwise the row shows the provider's own message.
+- **Daily quota reached:** the app stops retrying (waiting would not help), marks that model as exhausted for `QUOTA_COOLDOWN` seconds, and tries each model in `FALLBACK_MODELS` in order. When all are exhausted, remaining files fail immediately with a "try again later" message and send no further requests.
+- **Long waits:** if the provider asks for a wait that would exceed `MAX_TOTAL_WAIT`, the row says so instead of waiting.
 - **Failed rows** show the provider's error text in the Result column. Re-upload only those files later.
 - **HTTP 401/403:** the API key is wrong or missing.
 - **Connection interrupted:** the page retries each file up to 3 times. Keep the tab open and the computer awake while a batch runs.
