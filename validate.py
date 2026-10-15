@@ -1,5 +1,6 @@
 """Deterministic checks for invoice fields extracted by the vision model."""
 from datetime import date, datetime
+import os
 import re
 
 GSTIN_RE = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]$")
@@ -7,6 +8,8 @@ DATE_FORMATS = (
     "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d %b %Y",
     "%d %B %Y", "%d.%m.%Y", "%d/%m/%y", "%d-%m-%y",
 )
+# Allowed difference (in rupees) between subtotal + tax and total; override with AMOUNT_TOLERANCE.
+AMOUNT_TOLERANCE = float(os.getenv("AMOUNT_TOLERANCE", "1.0"))
 CATEGORIES = (
     "Software", "Travel", "Meals", "Office", "Utilities", "Hardware",
     "Professional services", "Other",
@@ -65,7 +68,8 @@ def validate(raw: dict) -> dict:
     """Normalize model output and flag anything that needs human review.
 
     A missing or suspicious field is never silently treated as verified.
-    This is a format/arithmetic sanity check, not a verification against GSTN.
+    This is a format/arithmetic sanity check. A GSTIN that matches the pattern is
+    unverified: it is not checked against the GSTN registry.
     """
     if not isinstance(raw, dict):
         raw = {}
@@ -97,14 +101,19 @@ def validate(raw: dict) -> dict:
         flags.append("subtotal missing or unreadable")
     if row["tax"] is None:
         flags.append("tax missing or unreadable")
-    if gstin and not GSTIN_RE.fullmatch(gstin):
+    if not gstin:
+        flags.append("GSTIN missing or unreadable")
+    elif not GSTIN_RE.fullmatch(gstin):
         flags.append("GSTIN format invalid")
     if category_input and category_input.casefold() not in category_lookup:
         flags.append("category not recognized; review category")
 
     if None not in (row["subtotal"], row["tax"], row["total"]):
-        if abs(row["subtotal"] + row["tax"] - row["total"]) > 1.0:
-            flags.append("subtotal + tax does not match total")
+        diff = abs(row["subtotal"] + row["tax"] - row["total"])
+        if diff > AMOUNT_TOLERANCE:
+            flags.append(
+                f"subtotal + tax does not match total (off by {diff:.2f}; tolerance {AMOUNT_TOLERANCE:g})"
+            )
 
     row["flags"] = flags
     return row

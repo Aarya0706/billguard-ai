@@ -1,4 +1,5 @@
 import unittest
+import unittest.mock
 from validate import validate, to_iso_date, to_num
 
 
@@ -28,13 +29,28 @@ class ValidationTests(unittest.TestCase):
         raw = self.good_invoice()
         raw["total"] = 1299
         result = validate(raw)
-        self.assertIn("subtotal + tax does not match total", result["flags"])
+        self.assertTrue(any(f.startswith("subtotal + tax does not match total") for f in result["flags"]))
 
     def test_missing_required_values_are_flagged(self):
         result = validate({"vendor": "Example Supplies", "category": "Other"})
         for expected in ("date missing or unreadable", "total missing or unreadable",
                          "subtotal missing or unreadable", "tax missing or unreadable"):
             self.assertIn(expected, result["flags"])
+
+    def test_missing_gstin_is_flagged_separately(self):
+        raw = self.good_invoice()
+        raw["gstin"] = None
+        flags = validate(raw)["flags"]
+        self.assertIn("GSTIN missing or unreadable", flags)
+        self.assertNotIn("GSTIN format invalid", flags)
+
+    def test_amount_tolerance_is_configurable(self):
+        import validate as v
+        raw = self.good_invoice()
+        raw["total"] = 1182
+        with unittest.mock.patch.object(v, "AMOUNT_TOLERANCE", 5.0):
+            self.assertEqual(v.validate(raw)["flags"], [])
+        self.assertTrue(any("does not match total" in f for f in v.validate(raw)["flags"]))
 
     def test_currency_formats(self):
         self.assertEqual(to_num("₹ 1,23,456.70"), 123456.70)

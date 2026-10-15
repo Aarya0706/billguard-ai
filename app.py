@@ -26,7 +26,9 @@ API_KEY = os.getenv("API_KEY", "ollama")
 MODEL = os.getenv("MODEL", "qwen2.5vl:7b")
 # Comma-separated backup models. When the current model hits a daily quota, the app switches to the next.
 FALLBACK_MODELS = [m.strip() for m in os.getenv("FALLBACK_MODELS", "").split(",") if m.strip()]
-_active_model = MODEL
+MAX_TOTAL_WAIT = float(os.getenv("MAX_TOTAL_WAIT", "60"))    # max seconds spent waiting on retries per request
+QUOTA_COOLDOWN = float(os.getenv("QUOTA_COOLDOWN", "3600"))  # skip a quota-exhausted model for this long
+_exhausted: dict[str, float] = {}  # model -> monotonic time when it may be tried again
 MAX_UPLOAD_MB = max(1, int(os.getenv("MAX_UPLOAD_MB", "15")))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 MAX_PDF_PAGES = max(1, int(os.getenv("MAX_PDF_PAGES", "8")))
@@ -173,55 +175,98 @@ def provider_message(response: httpx.Response) -> str:
     return (text or "").strip().replace("\n", " ")[:300]
 
 
+class ProviderLimitError(Exception):
+    """Rate-limit/quota problem; the message is safe to show in the review table."""
+
+
+class QuotaExhausted(ProviderLimitError):
+    pass
+
+
+class RateLimitWait(ProviderLimitError):
+    pass
+
+
+def _pick_model() -> str | None:
+    now = time.monotonic()
+    for model in [MODEL, *FALLBACK_MODELS]:
+        if _exhausted.get(model, 0) <= now:
+            return model
+    return None
+
+
+def classify_429(response: httpx.Response) -> str:
+    """Return 'too_large', 'daily' (waiting won't help) or 'short' (retry is reasonable)."""
+    msg = provider_message(response).lower()
+    try:
+        retry_after = float(response.headers.get("retry-after", ""))
+    except ValueError:
+        retry_after = None
+    if "too large" in msg or "reduce your message" in msg:
+        return "too_large"
+    if any(k in msg for k in ("per day", "daily", "tpd", "rpd")) or (retry_after and retry_after > 300):
+        return "daily"
+    return "short"
+
+
 def _retry_delay(response: httpx.Response, attempt: int) -> float:
     """Honor Retry-After when the provider sends it, else exponential backoff."""
     header = response.headers.get("retry-after")
     if header:
         try:
-            return min(max(float(header), 1.0), RETRY_MAX_DELAY)
+            return max(float(header), 1.0)  # not clamped: the caller compares it to MAX_TOTAL_WAIT
         except ValueError:
             pass
     return min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
 
 
 async def _post_with_retry(client: httpx.AsyncClient, body: dict) -> httpx.Response:
-    """POST to the model, retrying rate limits (429) and transient server errors."""
-    global _active_model
-    for attempt in range(MAX_RETRIES + 1):
+    """POST to the model. Retries short rate limits/5xx within a time budget; never retries exhausted quotas."""
+    waited = 0.0
+    attempt = 0
+    while True:
+        model = _pick_model()
+        if model is None:
+            raise QuotaExhausted(
+                "Daily quota used up on all configured models. Try again later "
+                "(limits usually reset within 24 hours) or add models to FALLBACK_MODELS."
+            )
         await _pace()
-        body["model"] = _active_model
+        body["model"] = model
         response = await client.post(
             f"{BASE_URL}/chat/completions",
             json=body,
             headers={"Authorization": f"Bearer {API_KEY}"},
         )
-        if response.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
-            # A huge Retry-After (daily quota) or an oversized request won't fix itself: fail fast.
-            raw = response.headers.get("retry-after", "")
-            try:
-                too_long = float(raw) > 300
-            except ValueError:
-                too_long = False
-            msg = provider_message(response).lower()
-            if response.status_code == 429 and (too_long or "per day" in msg):
-                remaining = [m for m in FALLBACK_MODELS if m != _active_model]
-                if remaining:
-                    logger.warning("Daily quota hit on %s; switching to %s", _active_model, remaining[0])
-                    _active_model = remaining[0]
-                    continue
-            if response.status_code == 429 and (too_long or "per day" in msg or "too large" in msg):
-                logger.error("Model API 429 (not retryable): %s", provider_message(response))
+        if response.status_code not in RETRYABLE_STATUS:
+            response.raise_for_status()
+            return response
+
+        if response.status_code == 429:
+            kind = classify_429(response)
+            if kind == "too_large":
+                logger.error("Model API 429 (request too large): %s", provider_message(response))
                 response.raise_for_status()
-            delay = _retry_delay(response, attempt)
-            logger.warning(
-                "Model API returned %s; retrying in %.0fs (attempt %d/%d). Provider says: %s",
-                response.status_code, delay, attempt + 1, MAX_RETRIES, provider_message(response),
+            if kind == "daily":
+                logger.warning("Daily quota hit on %s", model)
+                _exhausted[model] = time.monotonic() + QUOTA_COOLDOWN
+                continue  # next loop picks the next fallback model, or raises QuotaExhausted
+
+        attempt += 1
+        if attempt > MAX_RETRIES:
+            response.raise_for_status()
+        delay = _retry_delay(response, attempt - 1)
+        if waited + delay > MAX_TOTAL_WAIT:
+            raise RateLimitWait(
+                f"Rate limited; the provider asked for a ~{delay:.0f}s wait. "
+                "Try again in a few minutes, process fewer files, or raise MIN_REQUEST_INTERVAL."
             )
-            await asyncio.sleep(delay)
-            continue
-        response.raise_for_status()
-        return response
-    raise RuntimeError("unreachable")  # pragma: no cover
+        logger.warning(
+            "Model API returned %s; retrying in %.0fs (attempt %d/%d). Provider says: %s",
+            response.status_code, delay, attempt, MAX_RETRIES, provider_message(response),
+        )
+        waited += delay
+        await asyncio.sleep(delay)
 
 
 async def extract(client: httpx.AsyncClient, name: str, data: bytes) -> dict:
@@ -232,7 +277,6 @@ async def extract(client: httpx.AsyncClient, name: str, data: bytes) -> dict:
         for image_url in image_urls
     )
     body = {
-        "model": MODEL,
         "temperature": 0,
         "response_format": {"type": "json_object"},
         "messages": [{"role": "user", "content": content}],
@@ -249,40 +293,54 @@ def error_row(message: str) -> dict:
     }
 
 
-@app.get("/health")
-async def health():
-    """Show whether the configured model endpoint can be reached."""
-    reachable = False
-    model_listed = None
-    message = "Model server is not reachable. Start Ollama and check the model setup."
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            response = await client.get(
-                f"{BASE_URL}/models", headers={"Authorization": f"Bearer {API_KEY}"}
-            )
-            response.raise_for_status()
-            reachable = True
-            payload = response.json()
-            model_ids = [item.get("id", "") for item in payload.get("data", [])]
-            model_listed = MODEL in model_ids
-            message = "Model endpoint is reachable."
-            if model_listed is False:
-                message = "Endpoint is reachable, but the configured model was not listed; verify the model name."
-    except Exception:
-        logger.debug("Model health check failed", exc_info=True)
+def _norm(model_id: str) -> str:
+    return model_id.removeprefix("models/").strip().lower()
 
-    return {
-        "server_reachable": reachable,
-        "model_listed": model_listed,
-        "model": MODEL,
-        "mode": "local" if IS_LOCAL else "remote",
+
+@app.get("/health")
+async def health(probe: bool = False):
+    """Report what was actually checked: endpoint, key, model listing, and (opt-in) a tiny model request."""
+    result = {
+        "status": "endpoint_unavailable", "server_reachable": False, "model_listed": None,
+        "model_request_ok": None, "model": MODEL, "mode": "local" if IS_LOCAL else "remote",
         "privacy_note": (
             "Local mode: invoice images are sent only to the model endpoint on this computer."
             if IS_LOCAL else
             "Remote mode: invoice images are sent to the configured endpoint. Review that provider's privacy terms."
         ),
-        "message": message,
+        "message": "Could not reach the model endpoint at BASE_URL. Check that it is running and the URL is correct.",
     }
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{BASE_URL}/models", headers=headers)
+            if response.status_code in (401, 403):
+                result.update(server_reachable=True, status="auth_failed",
+                              message="Endpoint reachable, but the API key was rejected.")
+                return result
+            response.raise_for_status()
+            ids = {_norm(item.get("id", "")) for item in response.json().get("data", [])}
+            listed = _norm(MODEL) in ids
+            result.update(server_reachable=True, model_listed=listed)
+            if listed:
+                result.update(status="ok", message=(
+                    "Endpoint reachable and model listed. This does not confirm image input works; "
+                    "use /health?probe=true to test a request (uses a little quota)."))
+            else:
+                result.update(status="model_not_listed", message=(
+                    "Endpoint reachable, but the configured model is not in its model list. "
+                    "Check the name; some providers do not list every usable model."))
+            if probe:
+                p = await client.post(f"{BASE_URL}/chat/completions", headers=headers, json={
+                    "model": MODEL, "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "ping"}]})
+                result["model_request_ok"] = p.is_success
+                if not p.is_success:
+                    result.update(status="model_request_failed", message=(
+                        f"Model request failed (HTTP {p.status_code}): {provider_message(p)}"))
+    except Exception:
+        logger.debug("Model health check failed", exc_info=True)
+    return result
 
 
 @app.post("/extract")
@@ -302,6 +360,8 @@ async def extract_many(files: list[UploadFile] = File(...)):
                 data = await uploaded.read(MAX_UPLOAD_BYTES + 1)
                 row = validate(await extract(client, name, data))
             except InvoiceInputError as exc:
+                row = error_row(str(exc))
+            except ProviderLimitError as exc:
                 row = error_row(str(exc))
             except httpx.ConnectError:
                 row = error_row("model server unavailable; start Ollama and verify the model is installed")
