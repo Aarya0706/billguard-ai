@@ -1,0 +1,30 @@
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Keep invoice data out of source control by default
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.bmp
+*.tif
+*.tiff
+invoices.csv
+answer_key.csv
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
